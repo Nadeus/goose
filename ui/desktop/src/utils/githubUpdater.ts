@@ -1,5 +1,6 @@
 import { app } from 'electron';
 import { compareVersions } from 'compare-versions';
+import { spawn } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -24,6 +25,171 @@ interface UpdateCheckResult {
   downloadUrl?: string;
   releaseUrl?: string;
   error?: string;
+}
+
+interface InstallTarget {
+  targetPath: string;
+  relaunchPath: string;
+}
+
+interface SwapCommand {
+  command: string;
+  args: string[];
+}
+
+function runCommand(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${command} exited with code ${code}`));
+      }
+    });
+  });
+}
+
+function powershellQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function extractArchive(archivePath: string, destDir: string): Promise<void> {
+  if (process.platform === 'darwin') {
+    await runCommand('ditto', ['-x', '-k', archivePath, destDir]);
+  } else if (process.platform === 'win32') {
+    await runCommand('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      `Expand-Archive -LiteralPath ${powershellQuote(archivePath)} -DestinationPath ${powershellQuote(destDir)} -Force`,
+    ]);
+  } else {
+    await runCommand('unzip', ['-q', '-o', archivePath, '-d', destDir]);
+  }
+}
+
+async function resolvePayloadPath(extractDir: string): Promise<string> {
+  let current = extractDir;
+
+  for (let depth = 0; depth < 3; depth += 1) {
+    const entries = (await fs.readdir(current, { withFileTypes: true })).filter(
+      (entry) => !entry.name.startsWith('.') && entry.name !== '__MACOSX'
+    );
+
+    const appBundle = entries.find((entry) => entry.isDirectory() && entry.name.endsWith('.app'));
+    if (appBundle) {
+      return path.join(current, appBundle.name);
+    }
+
+    if (entries.length === 1 && entries[0].isDirectory()) {
+      current = path.join(current, entries[0].name);
+      continue;
+    }
+
+    return current;
+  }
+
+  return current;
+}
+
+function resolveInstallTarget(exePath: string): InstallTarget {
+  if (process.platform === 'darwin') {
+    const appPath = path.resolve(exePath, '..', '..', '..');
+    if (!appPath.endsWith('.app')) {
+      throw new Error(`Could not locate running .app bundle from ${exePath}`);
+    }
+    return { targetPath: appPath, relaunchPath: appPath };
+  }
+
+  return { targetPath: path.dirname(exePath), relaunchPath: exePath };
+}
+
+async function writeSwapScript(options: {
+  stagingDir: string;
+  payloadPath: string;
+  targetPath: string;
+  relaunchPath: string;
+  pid: number;
+}): Promise<SwapCommand> {
+  const { stagingDir, payloadPath, targetPath, relaunchPath, pid } = options;
+  const logPath = path.join(stagingDir, 'install.log');
+
+  if (process.platform === 'win32') {
+    const scriptPath = path.join(stagingDir, 'swap-and-relaunch.ps1');
+    const script = [
+      `$ErrorActionPreference = 'Continue'`,
+      `try { Start-Transcript -Path ${powershellQuote(logPath)} -Force | Out-Null } catch {}`,
+      `try { Wait-Process -Id ${pid} -Timeout 60 -ErrorAction Stop } catch {}`,
+      `Remove-Item -LiteralPath ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
+      `Copy-Item -LiteralPath ${powershellQuote(payloadPath)} -Destination ${powershellQuote(targetPath)} -Recurse -Force`,
+      `Start-Process -FilePath ${powershellQuote(relaunchPath)}`,
+      `try { Stop-Transcript | Out-Null } catch {}`,
+      `Remove-Item -LiteralPath ${powershellQuote(stagingDir)} -Recurse -Force -ErrorAction SilentlyContinue`,
+      '',
+    ].join('\r\n');
+
+    await fs.writeFile(scriptPath, script);
+    return {
+      command: 'powershell.exe',
+      args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+    };
+  }
+
+  const scriptPath = path.join(stagingDir, 'swap-and-relaunch.sh');
+  const copyAndRelaunch =
+    process.platform === 'darwin'
+      ? [
+          `ditto "${payloadPath}" "${targetPath}"`,
+          `xattr -dr com.apple.quarantine "${targetPath}" || true`,
+          `open "${relaunchPath}"`,
+        ]
+      : [`cp -a "${payloadPath}" "${targetPath}"`, `"${relaunchPath}" >/dev/null 2>&1 &`];
+
+  const script = [
+    '#!/bin/sh',
+    'set -e',
+    `exec >> "${logPath}" 2>&1`,
+    'attempt=0',
+    'while [ "$attempt" -lt 120 ]; do',
+    `  kill -0 ${pid} 2>/dev/null || break`,
+    '  sleep 0.5',
+    '  attempt=$((attempt + 1))',
+    'done',
+    `rm -rf "${targetPath}"`,
+    ...copyAndRelaunch,
+    `rm -rf "${stagingDir}"`,
+    '',
+  ].join('\n');
+
+  await fs.writeFile(scriptPath, script, { mode: 0o755 });
+  return { command: '/bin/sh', args: [scriptPath] };
+}
+
+export async function prepareUpdateInstall(options: {
+  archivePath: string;
+  targetPath: string;
+  relaunchPath: string;
+  pid: number;
+}): Promise<SwapCommand> {
+  const stagingDir = path.dirname(options.archivePath);
+  const extractDir = path.join(stagingDir, 'extracted');
+
+  await fs.rm(extractDir, { recursive: true, force: true });
+  await fs.mkdir(extractDir, { recursive: true });
+  await extractArchive(options.archivePath, extractDir);
+
+  const payloadPath = await resolvePayloadPath(extractDir);
+  log.info(`GitHubUpdater: Update payload: ${payloadPath}`);
+
+  return writeSwapScript({
+    stagingDir,
+    payloadPath,
+    targetPath: options.targetPath,
+    relaunchPath: options.relaunchPath,
+    pid: options.pid,
+  });
 }
 
 export class GitHubUpdater {
@@ -252,10 +418,10 @@ export class GitHubUpdater {
       const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
       log.info(`GitHubUpdater: Buffer created - ${buffer.length} bytes`);
 
-      // Save to Downloads directory
-      const downloadsDir = path.join(os.homedir(), 'Downloads');
+      const stagingDir = path.join(os.tmpdir(), `goose-update-${latestVersion}-${Date.now()}`);
+      await fs.mkdir(stagingDir, { recursive: true });
       const fileName = `${this.bundleName}-${latestVersion}.zip`;
-      const downloadPath = path.join(downloadsDir, fileName);
+      const downloadPath = path.join(stagingDir, fileName);
 
       log.info(`GitHubUpdater: Writing file to ${downloadPath}...`);
       await fs.writeFile(downloadPath, buffer);
@@ -264,8 +430,7 @@ export class GitHubUpdater {
       log.info(`=== GitHubUpdater: DOWNLOAD COMPLETE in ${totalDuration}ms ===`);
       log.info(`GitHubUpdater: File saved to ${downloadPath}`);
 
-      // Return success - user will handle extraction manually
-      return { success: true, downloadPath, extractedPath: downloadsDir };
+      return { success: true, downloadPath, extractedPath: stagingDir };
     } catch (error) {
       const duration = Date.now() - downloadStartTime;
       log.error(`=== GitHubUpdater: DOWNLOAD FAILED after ${duration}ms ===`);
@@ -275,6 +440,41 @@ export class GitHubUpdater {
         stack: error instanceof Error ? error.stack : 'No stack',
         name: error instanceof Error ? error.name : 'Unknown',
       });
+      return {
+        success: false,
+        error: errorMessage(error, 'Unknown error'),
+      };
+    }
+  }
+
+  async installUpdate(downloadPath: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      log.info('=== GitHubUpdater: STARTING AUTOMATIC INSTALL ===');
+      log.info(`GitHubUpdater: Download path: ${downloadPath}`);
+
+      await fs.access(downloadPath);
+
+      const { targetPath, relaunchPath } = resolveInstallTarget(app.getPath('exe'));
+      log.info(`GitHubUpdater: Install target: ${targetPath}`);
+
+      const swap = await prepareUpdateInstall({
+        archivePath: downloadPath,
+        targetPath,
+        relaunchPath,
+        pid: process.pid,
+      });
+
+      const child = spawn(swap.command, swap.args, {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+
+      log.info('=== GitHubUpdater: SWAP SCRIPT LAUNCHED, app will quit ===');
+      return { success: true };
+    } catch (error) {
+      log.error('GitHubUpdater: Error installing update:', error);
       return {
         success: false,
         error: errorMessage(error, 'Unknown error'),
