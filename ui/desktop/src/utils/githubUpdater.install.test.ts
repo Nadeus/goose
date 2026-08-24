@@ -152,6 +152,9 @@ describe('prepareUpdateInstall', () => {
     });
     swapProcess.unref();
 
+    const unrelatedFile = path.join(installRoot, 'unrelated-user-file.txt');
+    await fs.writeFile(unrelatedFile, 'keep me');
+
     await new Promise((resolve) => setTimeout(resolve, 2000));
     expect(await fs.readFile(versionFile, 'utf8')).toBe('1.0.0');
     expect(await exists(markerPath)).toBe(false);
@@ -167,5 +170,57 @@ describe('prepareUpdateInstall', () => {
     ).toBe(true);
     expect(await waitFor(() => exists(markerPath), 60000)).toBe(true);
     expect(await waitFor(async () => !(await exists(stagingDir)), 60000)).toBe(true);
+    expect(await fs.readFile(unrelatedFile, 'utf8')).toBe('keep me');
+    expect(await exists(`${installedRoot}.goose-previous`)).toBe(false);
   }, 150000);
+
+  it('restores the previous install when the new payload cannot be copied', async () => {
+    const workspace = await makeTempDir('goose-update-rollback-');
+    const stagingDir = path.join(workspace, 'staging');
+    const payloadSource = path.join(workspace, 'payload');
+    const installRoot = path.join(workspace, 'install');
+    const markerPath = path.join(workspace, 'relaunched.txt');
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.mkdir(payloadSource, { recursive: true });
+    await fs.mkdir(installRoot, { recursive: true });
+
+    const newPayload = await makePayload(payloadSource, '2.0.0', markerPath);
+    const archivePath = path.join(stagingDir, 'Goose-2.0.0.zip');
+    await zip(newPayload, archivePath);
+
+    const installedRoot = await makePayload(installRoot, '1.0.0', markerPath);
+    const versionFile = path.join(installedRoot, 'version.txt');
+
+    const relaunchPath =
+      process.platform === 'darwin'
+        ? installedRoot
+        : path.join(installedRoot, process.platform === 'win32' ? 'Goose.cmd' : 'Goose');
+
+    const exitedApp = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', windowsHide: true });
+    await new Promise((resolve) => exitedApp.once('exit', resolve));
+
+    const swap = await prepareUpdateInstall({
+      archivePath,
+      targetPath: installedRoot,
+      relaunchPath,
+      pid: exitedApp.pid!,
+    });
+
+    // Deleting the extracted payload makes the copy step fail, exercising the rollback path.
+    await fs.rm(path.join(stagingDir, 'extracted'), { recursive: true, force: true });
+
+    const swapProcess = spawn(swap.command, swap.args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    swapProcess.unref();
+
+    expect(
+      await waitFor(
+        async () => (await fs.readFile(versionFile, 'utf8').catch(() => '')) === '1.0.0',
+        30000
+      )
+    ).toBe(true);
+  }, 60000);
 });

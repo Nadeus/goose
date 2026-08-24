@@ -94,16 +94,96 @@ async function resolvePayloadPath(extractDir: string): Promise<string> {
   return current;
 }
 
-function resolveInstallTarget(exePath: string): InstallTarget {
+// Directories users commonly unpack portable builds into. Replacing one of these
+// wholesale would delete unrelated files, so an install there is never swapped.
+const SHARED_DIRECTORY_NAMES = new Set([
+  'applications',
+  'appdata',
+  'bin',
+  'desktop',
+  'documents',
+  'downloads',
+  'dropbox',
+  'etc',
+  'home',
+  'local',
+  'music',
+  'onedrive',
+  'opt',
+  'pictures',
+  'program files',
+  'program files (x86)',
+  'programdata',
+  'roaming',
+  'temp',
+  'tmp',
+  'usr',
+  'users',
+  'var',
+  'videos',
+]);
+
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSharedDirectory(dir: string): boolean {
+  if (dir === path.parse(dir).root) {
+    return true;
+  }
+  if (dir === path.resolve(os.homedir()) || dir === path.resolve(os.tmpdir())) {
+    return true;
+  }
+  return SHARED_DIRECTORY_NAMES.has(path.basename(dir).toLowerCase());
+}
+
+// Packaged Electron apps always ship resources/app.asar (or an unpacked resources/app)
+// next to the executable, which distinguishes an install root from an arbitrary folder.
+async function isPackagedAppDirectory(dir: string): Promise<boolean> {
+  const resources = path.join(dir, 'resources');
+  try {
+    if (!(await fs.stat(resources)).isDirectory()) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  return (
+    (await pathExists(path.join(resources, 'app.asar'))) ||
+    (await pathExists(path.join(resources, 'app')))
+  );
+}
+
+export async function resolveInstallTarget(exePath: string): Promise<InstallTarget> {
+  const resolvedExePath = path.resolve(exePath);
+
   if (process.platform === 'darwin') {
-    const appPath = path.resolve(exePath, '..', '..', '..');
+    const appPath = path.resolve(resolvedExePath, '..', '..', '..');
     if (!appPath.endsWith('.app')) {
-      throw new Error(`Could not locate running .app bundle from ${exePath}`);
+      throw new Error(`Could not locate running .app bundle from ${resolvedExePath}`);
     }
     return { targetPath: appPath, relaunchPath: appPath };
   }
 
-  return { targetPath: path.dirname(exePath), relaunchPath: exePath };
+  const installDir = path.dirname(resolvedExePath);
+
+  if (!(await isPackagedAppDirectory(installDir))) {
+    throw new Error(
+      `Refusing to auto-update: ${installDir} does not look like an app install directory`
+    );
+  }
+
+  if (isSharedDirectory(installDir)) {
+    throw new Error(`Refusing to auto-update: ${installDir} is a shared directory`);
+  }
+
+  return { targetPath: installDir, relaunchPath: resolvedExePath };
 }
 
 async function writeSwapScript(options: {
@@ -115,6 +195,9 @@ async function writeSwapScript(options: {
 }): Promise<SwapCommand> {
   const { stagingDir, payloadPath, targetPath, relaunchPath, pid } = options;
   const logPath = path.join(stagingDir, 'install.log');
+  // The previous install is moved aside rather than deleted so a failed copy can be rolled back.
+  // It stays beside the target so the move is a same-filesystem rename instead of a full copy.
+  const backupPath = `${targetPath}.goose-previous`;
 
   if (process.platform === 'win32') {
     const scriptPath = path.join(stagingDir, 'swap-and-relaunch.ps1');
@@ -122,8 +205,16 @@ async function writeSwapScript(options: {
       `$ErrorActionPreference = 'Continue'`,
       `try { Start-Transcript -Path ${powershellQuote(logPath)} -Force | Out-Null } catch {}`,
       `try { Wait-Process -Id ${pid} -Timeout 60 -ErrorAction Stop } catch {}`,
-      `Remove-Item -LiteralPath ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
-      `Copy-Item -LiteralPath ${powershellQuote(payloadPath)} -Destination ${powershellQuote(targetPath)} -Recurse -Force`,
+      `Remove-Item -LiteralPath ${powershellQuote(backupPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
+      `Move-Item -LiteralPath ${powershellQuote(targetPath)} -Destination ${powershellQuote(backupPath)} -Force`,
+      `if (Test-Path -LiteralPath ${powershellQuote(targetPath)}) { throw 'Could not move previous install aside' }`,
+      `try {`,
+      `  Copy-Item -LiteralPath ${powershellQuote(payloadPath)} -Destination ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction Stop`,
+      `  Remove-Item -LiteralPath ${powershellQuote(backupPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
+      `} catch {`,
+      `  Remove-Item -LiteralPath ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
+      `  Move-Item -LiteralPath ${powershellQuote(backupPath)} -Destination ${powershellQuote(targetPath)} -Force`,
+      `}`,
       `Start-Process -FilePath ${powershellQuote(relaunchPath)}`,
       `try { Stop-Transcript | Out-Null } catch {}`,
       `Remove-Item -LiteralPath ${powershellQuote(stagingDir)} -Recurse -Force -ErrorAction SilentlyContinue`,
@@ -138,14 +229,14 @@ async function writeSwapScript(options: {
   }
 
   const scriptPath = path.join(stagingDir, 'swap-and-relaunch.sh');
-  const copyAndRelaunch =
+  const copyCommand =
     process.platform === 'darwin'
-      ? [
-          `ditto "${payloadPath}" "${targetPath}"`,
-          `xattr -dr com.apple.quarantine "${targetPath}" || true`,
-          `open "${relaunchPath}"`,
-        ]
-      : [`cp -a "${payloadPath}" "${targetPath}"`, `"${relaunchPath}" >/dev/null 2>&1 &`];
+      ? `ditto "${payloadPath}" "${targetPath}"`
+      : `cp -a "${payloadPath}" "${targetPath}"`;
+  const relaunch =
+    process.platform === 'darwin'
+      ? [`xattr -dr com.apple.quarantine "${targetPath}" || true`, `open "${relaunchPath}"`]
+      : [`"${relaunchPath}" >/dev/null 2>&1 &`];
 
   const script = [
     '#!/bin/sh',
@@ -157,8 +248,15 @@ async function writeSwapScript(options: {
     '  sleep 0.5',
     '  attempt=$((attempt + 1))',
     'done',
-    `rm -rf "${targetPath}"`,
-    ...copyAndRelaunch,
+    `rm -rf "${backupPath}"`,
+    `mv "${targetPath}" "${backupPath}"`,
+    `if ${copyCommand}; then`,
+    `  rm -rf "${backupPath}"`,
+    'else',
+    `  rm -rf "${targetPath}"`,
+    `  mv "${backupPath}" "${targetPath}"`,
+    'fi',
+    ...relaunch,
     `rm -rf "${stagingDir}"`,
     '',
   ].join('\n');
@@ -454,7 +552,7 @@ export class GitHubUpdater {
 
       await fs.access(downloadPath);
 
-      const { targetPath, relaunchPath } = resolveInstallTarget(app.getPath('exe'));
+      const { targetPath, relaunchPath } = await resolveInstallTarget(app.getPath('exe'));
       log.info(`GitHubUpdater: Install target: ${targetPath}`);
 
       const swap = await prepareUpdateInstall({
