@@ -391,6 +391,20 @@ async function writeSwapScript(options: {
   return { command: '/bin/sh', args: [scriptPath] };
 }
 
+// Node's detached flag becomes DETACHED_PROCESS on Windows, which leaves the child with no
+// console, and powershell.exe exits before its first statement without one. windowsHide still
+// allocates a console without showing a window, and Windows keeps a child alive after its
+// parent exits, so the swap outlives the quit without detaching. POSIX still detaches so the
+// script survives the app's process group going away.
+export function launchSwapScript(swap: SwapCommand): void {
+  const child = spawn(swap.command, swap.args, {
+    detached: process.platform !== 'win32',
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+}
+
 // A ZIP can be valid yet packaged without the expected application, which would let the swap
 // replace a working install with an unrunnable one. Checking before the backup is deleted keeps
 // the failure recoverable.
@@ -714,12 +728,7 @@ export class GitHubUpdater {
         pid: process.pid,
       });
 
-      const child = spawn(swap.command, swap.args, {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      child.unref();
+      launchSwapScript(swap);
 
       log.info('=== GitHubUpdater: SWAP SCRIPT LAUNCHED, app will quit ===');
       return { success: true };

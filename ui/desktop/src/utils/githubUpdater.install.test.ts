@@ -3,10 +3,9 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { prepareUpdateInstall } from './githubUpdater';
+import { launchSwapScript, prepareUpdateInstall } from './githubUpdater';
 
 const tempDirs: string[] = [];
-const spawnErrors: string[] = [];
 
 function run(command: string, args: string[], cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -137,109 +136,23 @@ async function listTree(dir: string, prefix = ''): Promise<string> {
   return out;
 }
 
-// The swap script runs detached, so its own stderr is the only record of a PowerShell parse
-// or execution error. The log lives outside the staging directory because the script deletes
-// that directory when it finishes.
-async function spawnSwapScript(
-  swap: { command: string; args: string[] },
-  stagingDir: string
-): Promise<void> {
-  const handle = await fs.open(`${stagingDir}-spawn.log`, 'a');
-  const child = spawn(swap.command, swap.args, {
-    detached: true,
-    stdio: ['ignore', handle.fd, handle.fd],
-    windowsHide: true,
-  });
-  // A failed spawn reports through the error event rather than stdio, so an interpreter that
-  // cannot be launched at all would otherwise leave no trace.
-  child.on('error', (error) => spawnErrors.push(`${swap.command}: ${error.message}`));
-  child.unref();
-  await handle.close();
-}
-
-// The swap script deletes its staging directory when it finishes, so these logs are kept
-// beside it and are the only way to see why a detached script gave up.
+// The swap script deletes its staging directory when it finishes, so its log is kept beside
+// that directory and is the only record of why a background script gave up.
 async function diagnostics(stagingDir: string, installRoot: string): Promise<string> {
   const logText = await fs
     .readFile(`${stagingDir}-install.log`, 'utf8')
     .catch(() => '(no install.log)');
-  const spawnText = await fs
-    .readFile(`${stagingDir}-spawn.log`, 'utf8')
-    .catch(() => '(no spawn.log)');
   return [
     '',
     '--- install.log ---',
     logText,
-    '--- script stdout/stderr ---',
-    spawnText,
-    '--- spawn errors ---',
-    spawnErrors.join('\n') || '(none)',
     '--- install dir ---',
     await listTree(installRoot),
   ].join('\n');
 }
 
 afterEach(async () => {
-  spawnErrors.length = 0;
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
-});
-
-// Running the generated script in the foreground is the only way to see its exit code and
-// error output. The production path detaches it, which hides both.
-function runToCompletion(
-  command: string,
-  args: string[]
-): Promise<{ code: number | null; output: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true });
-    let output = '';
-    child.stdout.on('data', (chunk) => (output += chunk));
-    child.stderr.on('data', (chunk) => (output += chunk));
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ code, output }));
-  });
-}
-
-describe('swap script execution', () => {
-  it('runs to completion and reports no error', async () => {
-    const workspace = await makeTempDir('goose-update-probe-');
-    const stagingDir = path.join(workspace, 'staging');
-    const payloadSource = path.join(workspace, 'payload');
-    const installRoot = path.join(workspace, 'install');
-    const markerPath = path.join(workspace, 'relaunched.txt');
-    await fs.mkdir(stagingDir, { recursive: true });
-    await fs.mkdir(payloadSource, { recursive: true });
-    await fs.mkdir(installRoot, { recursive: true });
-
-    const newPayload = await makePayload(payloadSource, '2.0.0', markerPath);
-    const archivePath = path.join(stagingDir, 'Goose-2.0.0.zip');
-    await zip(newPayload, archivePath);
-
-    const installedRoot = await makePayload(installRoot, '1.0.0', markerPath);
-    const relaunchPath =
-      process.platform === 'darwin'
-        ? installedRoot
-        : path.join(installedRoot, executableRelativePath());
-
-    const exited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', windowsHide: true });
-    await new Promise((resolve) => exited.once('exit', resolve));
-
-    const swap = await prepareUpdateInstall({
-      archivePath,
-      targetPath: installedRoot,
-      relaunchPath,
-      executableRelativePath: executableRelativePath(),
-      pid: exited.pid!,
-    });
-
-    const { code, output } = await runToCompletion(swap.command, swap.args);
-    const detail = `exit=${code}\noutput:\n${output}\ninstall dir:\n${await listTree(installRoot)}`;
-
-    expect(code, detail).toBe(0);
-    expect(await fs.readFile(path.join(installedRoot, 'version.txt'), 'utf8'), detail).toBe(
-      '2.0.0'
-    );
-  }, 120000);
 });
 
 describe('prepareUpdateInstall', () => {
@@ -279,7 +192,7 @@ describe('prepareUpdateInstall', () => {
       pid: runningApp.pid!,
     });
 
-    await spawnSwapScript(swap, stagingDir);
+    launchSwapScript(swap);
 
     const unrelatedFile = path.join(installRoot, 'unrelated-user-file.txt');
     await fs.writeFile(unrelatedFile, 'keep me');
@@ -338,7 +251,7 @@ describe('prepareUpdateInstall', () => {
     // Deleting the extracted payload makes the copy step fail, exercising the rollback path.
     await fs.rm(path.join(stagingDir, 'extracted'), { recursive: true, force: true });
 
-    await spawnSwapScript(swap, stagingDir);
+    launchSwapScript(swap);
 
     // The restored app is relaunched at the end of the swap, so the marker proves the script
     // ran to completion rather than merely that the rollback has not happened yet.
