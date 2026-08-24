@@ -120,6 +120,31 @@ async function exists(target: string): Promise<boolean> {
   }
 }
 
+async function listTree(dir: string, prefix = ''): Promise<string> {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => null);
+  if (!entries) {
+    return `${prefix}(missing)\n`;
+  }
+
+  let out = '';
+  for (const entry of entries) {
+    out += `${prefix}${entry.name}${entry.isDirectory() ? '/' : ''}\n`;
+    if (entry.isDirectory() && prefix.length < 4) {
+      out += await listTree(path.join(dir, entry.name), `${prefix}  `);
+    }
+  }
+  return out;
+}
+
+// The swap script only deletes its staging directory on success, so its transcript survives
+// failures and is the only way to see why a detached script gave up.
+async function diagnostics(stagingDir: string, installRoot: string): Promise<string> {
+  const logText = await fs
+    .readFile(path.join(stagingDir, 'install.log'), 'utf8')
+    .catch(() => '(no install.log)');
+  return `\n--- install.log ---\n${logText}\n--- install dir ---\n${await listTree(installRoot)}`;
+}
+
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -178,12 +203,11 @@ describe('prepareUpdateInstall', () => {
     runningApp.kill();
     await new Promise((resolve) => runningApp.once('exit', resolve));
 
-    expect(
-      await waitFor(
-        async () => (await fs.readFile(versionFile, 'utf8').catch(() => '')) === '2.0.0',
-        60000
-      )
-    ).toBe(true);
+    const swapped = await waitFor(
+      async () => (await fs.readFile(versionFile, 'utf8').catch(() => '')) === '2.0.0',
+      60000
+    );
+    expect(swapped, await diagnostics(stagingDir, installRoot)).toBe(true);
     expect(await waitFor(() => exists(markerPath), 60000)).toBe(true);
     expect(await waitFor(async () => !(await exists(stagingDir)), 60000)).toBe(true);
     expect(await fs.readFile(unrelatedFile, 'utf8')).toBe('keep me');
@@ -235,7 +259,8 @@ describe('prepareUpdateInstall', () => {
 
     // The restored app is relaunched at the end of the swap, so the marker proves the script
     // ran to completion rather than merely that the rollback has not happened yet.
-    expect(await waitFor(() => exists(markerPath), 30000)).toBe(true);
+    const relaunched = await waitFor(() => exists(markerPath), 30000);
+    expect(relaunched, await diagnostics(stagingDir, installRoot)).toBe(true);
     expect(await exists(`${installedRoot}.goose-previous`)).toBe(false);
     expect(await fs.readFile(versionFile, 'utf8')).toBe('1.0.0');
     expect(await exists(path.join(installedRoot, executableRelativePath()))).toBe(true);

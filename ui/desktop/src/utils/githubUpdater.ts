@@ -293,7 +293,15 @@ async function writeSwapScript(options: {
     const script = [
       `$ErrorActionPreference = 'Continue'`,
       `try { Start-Transcript -Path ${powershellQuote(logPath)} -Force | Out-Null } catch {}`,
-      `try { Wait-Process -Id ${pid} -Timeout 60 -ErrorAction Stop } catch {}`,
+      // Polling instead of Wait-Process avoids aborting on the brief window where a just-exited
+      // process is still reported, and works for a process this script did not start.
+      `$attempt = 0`,
+      `while ($attempt -lt 120) {`,
+      `  if (-not (Get-Process -Id ${pid} -ErrorAction SilentlyContinue)) { break }`,
+      `  Start-Sleep -Milliseconds 500`,
+      `  $attempt = $attempt + 1`,
+      `}`,
+      // Replacing a bundle while it is running corrupts the install, so a stalled quit aborts.
       `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { throw 'App is still running; aborting update' }`,
       `Remove-Item -LiteralPath ${powershellQuote(backupPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
       `Move-Item -LiteralPath ${powershellQuote(targetPath)} -Destination ${powershellQuote(backupPath)} -Force`,
