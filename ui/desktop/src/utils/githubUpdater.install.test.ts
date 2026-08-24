@@ -138,12 +138,13 @@ async function listTree(dir: string, prefix = ''): Promise<string> {
 }
 
 // The swap script runs detached, so its own stderr is the only record of a PowerShell parse
-// or execution error. Capturing it keeps those failures visible in CI.
+// or execution error. The log lives outside the staging directory because the script deletes
+// that directory when it finishes.
 async function spawnSwapScript(
   swap: { command: string; args: string[] },
   stagingDir: string
 ): Promise<void> {
-  const handle = await fs.open(path.join(stagingDir, 'spawn.log'), 'a');
+  const handle = await fs.open(`${stagingDir}-spawn.log`, 'a');
   const child = spawn(swap.command, swap.args, {
     detached: true,
     stdio: ['ignore', handle.fd, handle.fd],
@@ -156,14 +157,14 @@ async function spawnSwapScript(
   await handle.close();
 }
 
-// The swap script only deletes its staging directory on success, so its transcript survives
-// failures and is the only way to see why a detached script gave up.
+// The swap script deletes its staging directory when it finishes, so these logs are kept
+// beside it and are the only way to see why a detached script gave up.
 async function diagnostics(stagingDir: string, installRoot: string): Promise<string> {
   const logText = await fs
-    .readFile(path.join(stagingDir, 'install.log'), 'utf8')
+    .readFile(`${stagingDir}-install.log`, 'utf8')
     .catch(() => '(no install.log)');
   const spawnText = await fs
-    .readFile(path.join(stagingDir, 'spawn.log'), 'utf8')
+    .readFile(`${stagingDir}-spawn.log`, 'utf8')
     .catch(() => '(no spawn.log)');
   return [
     '',

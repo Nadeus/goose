@@ -278,7 +278,9 @@ async function writeSwapScript(options: {
 }): Promise<SwapCommand> {
   const { stagingDir, payloadPath, targetPath, relaunchPath, executableRelativePath, pid } =
     options;
-  const logPath = path.join(stagingDir, 'install.log');
+  // The script deletes its staging directory once it finishes, so the log lives beside that
+  // directory to survive cleanup and stay available when diagnosing a failed update.
+  const logPath = `${stagingDir}-install.log`;
   // The previous install is moved aside rather than deleted so a failed copy can be rolled back.
   // It stays beside the target so the move is a same-filesystem rename instead of a full copy.
   const backupPath = `${targetPath}.goose-previous`;
@@ -292,17 +294,26 @@ async function writeSwapScript(options: {
     const installedExe = powershellQuote(path.join(targetPath, executableRelativePath));
     const script = [
       `$ErrorActionPreference = 'Continue'`,
-      `try { Start-Transcript -Path ${powershellQuote(logPath)} -Force | Out-Null } catch {}`,
-      // Polling instead of Wait-Process avoids aborting on the brief window where a just-exited
-      // process is still reported, and works for a process this script did not start.
+      // Start-Transcript silently produces no file when it is unavailable, so the log is written
+      // directly to keep a failing detached script diagnosable.
+      `function Write-Log($message) { try { Add-Content -LiteralPath ${powershellQuote(logPath)} -Value $message } catch {} }`,
+      `Write-Log "swap starting for pid ${pid}"`,
+      // A process object reports HasExited once the app is gone, which distinguishes a live app
+      // from the handle that lingers briefly after exit.
       `$attempt = 0`,
       `while ($attempt -lt 120) {`,
-      `  if (-not (Get-Process -Id ${pid} -ErrorAction SilentlyContinue)) { break }`,
+      `  $proc = Get-Process -Id ${pid} -ErrorAction SilentlyContinue`,
+      `  if (-not $proc -or $proc.HasExited) { break }`,
       `  Start-Sleep -Milliseconds 500`,
       `  $attempt = $attempt + 1`,
       `}`,
-      // Replacing a bundle while it is running corrupts the install, so a stalled quit aborts.
-      `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { throw 'App is still running; aborting update' }`,
+      // Replacing an install while it runs corrupts it, so a stalled quit aborts the swap.
+      `$proc = Get-Process -Id ${pid} -ErrorAction SilentlyContinue`,
+      `if ($proc -and -not $proc.HasExited) {`,
+      `  Write-Log 'app is still running; aborting update'`,
+      `  exit 1`,
+      `}`,
+      `Write-Log 'app has exited; swapping install'`,
       `Remove-Item -LiteralPath ${powershellQuote(backupPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
       `Move-Item -LiteralPath ${powershellQuote(targetPath)} -Destination ${powershellQuote(backupPath)} -Force`,
       `if (Test-Path -LiteralPath ${powershellQuote(targetPath)}) { throw 'Could not move previous install aside' }`,
