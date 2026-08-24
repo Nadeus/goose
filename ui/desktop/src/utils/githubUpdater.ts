@@ -30,6 +30,8 @@ interface UpdateCheckResult {
 interface InstallTarget {
   targetPath: string;
   relaunchPath: string;
+  // Used to confirm the extracted payload really is an app before the backup is deleted.
+  executableRelativePath: string;
 }
 
 interface SwapCommand {
@@ -53,6 +55,10 @@ function runCommand(command: string, args: string[]): Promise<void> {
 
 function powershellQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 async function extractArchive(archivePath: string, destDir: string): Promise<void> {
@@ -93,6 +99,37 @@ async function resolvePayloadPath(extractDir: string): Promise<string> {
 
   return current;
 }
+
+// Electron ships these alongside the executable in every packaged build, so an install
+// root always contains them. Their absence means the directory is not an install root.
+const REQUIRED_INSTALL_DIRECTORIES = ['locales', 'resources'];
+
+// Everything a packaged Electron app is allowed to place next to its executable. Anything
+// else means the directory holds unrelated files and cannot be replaced wholesale.
+const ELECTRON_RUNTIME_DIRECTORIES = new Set(['locales', 'resources', 'swiftshader']);
+
+const ELECTRON_RUNTIME_FILES = new Set([
+  'chrome-sandbox',
+  'chrome_crashpad_handler',
+  'icudtl.dat',
+  'libvulkan.so.1',
+  'license',
+  'licenses.chromium.html',
+  'version',
+]);
+
+const ELECTRON_RUNTIME_EXTENSIONS = new Set([
+  '.bin',
+  '.dat',
+  '.dll',
+  '.exe',
+  '.html',
+  '.json',
+  '.node',
+  '.pak',
+  '.so',
+  '.txt',
+]);
 
 // Directories users commonly unpack portable builds into. Replacing one of these
 // wholesale would delete unrelated files, so an install there is never swapped.
@@ -142,22 +179,50 @@ function isSharedDirectory(dir: string): boolean {
   return SHARED_DIRECTORY_NAMES.has(path.basename(dir).toLowerCase());
 }
 
-// Packaged Electron apps always ship resources/app.asar (or an unpacked resources/app)
-// next to the executable, which distinguishes an install root from an arbitrary folder.
-async function isPackagedAppDirectory(dir: string): Promise<boolean> {
-  const resources = path.join(dir, 'resources');
+async function isDirectory(target: string): Promise<boolean> {
   try {
-    if (!(await fs.stat(resources)).isDirectory()) {
-      return false;
-    }
+    return (await fs.stat(target)).isDirectory();
   } catch {
     return false;
   }
+}
 
+// Packaged Electron apps always ship resources/app.asar (or an unpacked resources/app)
+// alongside the locales directory, which distinguishes an install root from an arbitrary folder.
+async function isPackagedAppDirectory(dir: string): Promise<boolean> {
+  for (const required of REQUIRED_INSTALL_DIRECTORIES) {
+    if (!(await isDirectory(path.join(dir, required)))) {
+      return false;
+    }
+  }
+
+  const resources = path.join(dir, 'resources');
   return (
     (await pathExists(path.join(resources, 'app.asar'))) ||
     (await pathExists(path.join(resources, 'app')))
   );
+}
+
+// A basename blacklist cannot prove a directory is safe to replace, so require that every
+// entry belongs to a packaged Electron app. Anything else means the directory is shared
+// with unrelated files that a wholesale swap would delete.
+async function findUnexpectedInstallEntries(dir: string, exeName: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+
+  return entries
+    .filter((entry) => {
+      const name = entry.name.toLowerCase();
+      if (name.startsWith('.') || name === exeName.toLowerCase()) {
+        return false;
+      }
+      if (entry.isDirectory()) {
+        return !ELECTRON_RUNTIME_DIRECTORIES.has(name);
+      }
+      return (
+        !ELECTRON_RUNTIME_FILES.has(name) && !ELECTRON_RUNTIME_EXTENSIONS.has(path.extname(name))
+      );
+    })
+    .map((entry) => entry.name);
 }
 
 export async function resolveInstallTarget(exePath: string): Promise<InstallTarget> {
@@ -168,7 +233,11 @@ export async function resolveInstallTarget(exePath: string): Promise<InstallTarg
     if (!appPath.endsWith('.app')) {
       throw new Error(`Could not locate running .app bundle from ${resolvedExePath}`);
     }
-    return { targetPath: appPath, relaunchPath: appPath };
+    return {
+      targetPath: appPath,
+      relaunchPath: appPath,
+      executableRelativePath: path.relative(appPath, resolvedExePath),
+    };
   }
 
   const installDir = path.dirname(resolvedExePath);
@@ -183,7 +252,20 @@ export async function resolveInstallTarget(exePath: string): Promise<InstallTarg
     throw new Error(`Refusing to auto-update: ${installDir} is a shared directory`);
   }
 
-  return { targetPath: installDir, relaunchPath: resolvedExePath };
+  const unexpected = await findUnexpectedInstallEntries(installDir, path.basename(resolvedExePath));
+  if (unexpected.length > 0) {
+    throw new Error(
+      `Refusing to auto-update: ${installDir} is not dedicated to the app (found ${unexpected
+        .slice(0, 5)
+        .join(', ')})`
+    );
+  }
+
+  return {
+    targetPath: installDir,
+    relaunchPath: resolvedExePath,
+    executableRelativePath: path.basename(resolvedExePath),
+  };
 }
 
 async function writeSwapScript(options: {
@@ -191,9 +273,11 @@ async function writeSwapScript(options: {
   payloadPath: string;
   targetPath: string;
   relaunchPath: string;
+  executableRelativePath: string;
   pid: number;
 }): Promise<SwapCommand> {
-  const { stagingDir, payloadPath, targetPath, relaunchPath, pid } = options;
+  const { stagingDir, payloadPath, targetPath, relaunchPath, executableRelativePath, pid } =
+    options;
   const logPath = path.join(stagingDir, 'install.log');
   // The previous install is moved aside rather than deleted so a failed copy can be rolled back.
   // It stays beside the target so the move is a same-filesystem rename instead of a full copy.
@@ -201,15 +285,26 @@ async function writeSwapScript(options: {
 
   if (process.platform === 'win32') {
     const scriptPath = path.join(stagingDir, 'swap-and-relaunch.ps1');
+    // Copy-Item nests the source inside an existing destination directory, so the payload
+    // contents are copied into a freshly created target instead of the payload directory itself.
+    // Get-ChildItem enumerates them via -LiteralPath so paths containing glob metacharacters
+    // are not expanded, and -Force keeps hidden entries.
+    const installedExe = powershellQuote(path.join(targetPath, executableRelativePath));
     const script = [
       `$ErrorActionPreference = 'Continue'`,
       `try { Start-Transcript -Path ${powershellQuote(logPath)} -Force | Out-Null } catch {}`,
       `try { Wait-Process -Id ${pid} -Timeout 60 -ErrorAction Stop } catch {}`,
+      `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { throw 'App is still running; aborting update' }`,
       `Remove-Item -LiteralPath ${powershellQuote(backupPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
       `Move-Item -LiteralPath ${powershellQuote(targetPath)} -Destination ${powershellQuote(backupPath)} -Force`,
       `if (Test-Path -LiteralPath ${powershellQuote(targetPath)}) { throw 'Could not move previous install aside' }`,
       `try {`,
-      `  Copy-Item -LiteralPath ${powershellQuote(payloadPath)} -Destination ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction Stop`,
+      `  New-Item -ItemType Directory -Path ${powershellQuote(targetPath)} -Force -ErrorAction Stop | Out-Null`,
+      `  $payloadEntries = (Get-ChildItem -LiteralPath ${powershellQuote(payloadPath)} -Force).FullName`,
+      `  Copy-Item -LiteralPath $payloadEntries -Destination ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction Stop`,
+      // A valid archive can still be packaged without the executable, so the backup is only
+      // discarded once the copied payload is confirmed to be a runnable install.
+      `  if (-not (Test-Path -LiteralPath ${installedExe})) { throw 'Updated install is missing its executable' }`,
       `  Remove-Item -LiteralPath ${powershellQuote(backupPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
       `} catch {`,
       `  Remove-Item -LiteralPath ${powershellQuote(targetPath)} -Recurse -Force -ErrorAction SilentlyContinue`,
@@ -229,35 +324,47 @@ async function writeSwapScript(options: {
   }
 
   const scriptPath = path.join(stagingDir, 'swap-and-relaunch.sh');
+  const quotedPayload = shellQuote(payloadPath);
+  const quotedTarget = shellQuote(targetPath);
+  const quotedBackup = shellQuote(backupPath);
+  const quotedRelaunch = shellQuote(relaunchPath);
+  const quotedInstalledExe = shellQuote(path.join(targetPath, executableRelativePath));
   const copyCommand =
     process.platform === 'darwin'
-      ? `ditto "${payloadPath}" "${targetPath}"`
-      : `cp -a "${payloadPath}" "${targetPath}"`;
+      ? `ditto ${quotedPayload} ${quotedTarget}`
+      : `cp -a ${quotedPayload} ${quotedTarget}`;
   const relaunch =
     process.platform === 'darwin'
-      ? [`xattr -dr com.apple.quarantine "${targetPath}" || true`, `open "${relaunchPath}"`]
-      : [`"${relaunchPath}" >/dev/null 2>&1 &`];
+      ? [`xattr -dr com.apple.quarantine ${quotedTarget} || true`, `open ${quotedRelaunch}`]
+      : [`${quotedRelaunch} >/dev/null 2>&1 &`];
 
   const script = [
     '#!/bin/sh',
     'set -e',
-    `exec >> "${logPath}" 2>&1`,
+    `exec >> ${shellQuote(logPath)} 2>&1`,
     'attempt=0',
     'while [ "$attempt" -lt 120 ]; do',
     `  kill -0 ${pid} 2>/dev/null || break`,
     '  sleep 0.5',
     '  attempt=$((attempt + 1))',
     'done',
-    `rm -rf "${backupPath}"`,
-    `mv "${targetPath}" "${backupPath}"`,
-    `if ${copyCommand}; then`,
-    `  rm -rf "${backupPath}"`,
+    // Touching a live bundle corrupts the running app, so a stalled shutdown aborts the swap.
+    `if kill -0 ${pid} 2>/dev/null; then`,
+    '  echo "App is still running; aborting update"',
+    '  exit 1',
+    'fi',
+    `rm -rf ${quotedBackup}`,
+    `mv ${quotedTarget} ${quotedBackup}`,
+    // A valid archive can still be packaged without the executable, so the backup is only
+    // discarded once the copied payload is confirmed to be a runnable install.
+    `if ${copyCommand} && [ -x ${quotedInstalledExe} ]; then`,
+    `  rm -rf ${quotedBackup}`,
     'else',
-    `  rm -rf "${targetPath}"`,
-    `  mv "${backupPath}" "${targetPath}"`,
+    `  rm -rf ${quotedTarget}`,
+    `  mv ${quotedBackup} ${quotedTarget}`,
     'fi',
     ...relaunch,
-    `rm -rf "${stagingDir}"`,
+    `rm -rf ${shellQuote(stagingDir)}`,
     '',
   ].join('\n');
 
@@ -265,10 +372,30 @@ async function writeSwapScript(options: {
   return { command: '/bin/sh', args: [scriptPath] };
 }
 
+// A ZIP can be valid yet packaged without the expected application, which would let the swap
+// replace a working install with an unrunnable one. Checking before the backup is deleted keeps
+// the failure recoverable.
+async function assertPayloadIsRunnable(
+  payloadPath: string,
+  executableRelativePath: string
+): Promise<void> {
+  const executable = path.join(payloadPath, executableRelativePath);
+  if (!(await pathExists(executable))) {
+    throw new Error(
+      `Update payload is missing its executable (expected ${executableRelativePath} in ${path.basename(payloadPath)})`
+    );
+  }
+
+  if (process.platform === 'darwin' && !payloadPath.endsWith('.app')) {
+    throw new Error(`Update payload is not an .app bundle: ${payloadPath}`);
+  }
+}
+
 export async function prepareUpdateInstall(options: {
   archivePath: string;
   targetPath: string;
   relaunchPath: string;
+  executableRelativePath: string;
   pid: number;
 }): Promise<SwapCommand> {
   const stagingDir = path.dirname(options.archivePath);
@@ -281,11 +408,14 @@ export async function prepareUpdateInstall(options: {
   const payloadPath = await resolvePayloadPath(extractDir);
   log.info(`GitHubUpdater: Update payload: ${payloadPath}`);
 
+  await assertPayloadIsRunnable(payloadPath, options.executableRelativePath);
+
   return writeSwapScript({
     stagingDir,
     payloadPath,
     targetPath: options.targetPath,
     relaunchPath: options.relaunchPath,
+    executableRelativePath: options.executableRelativePath,
     pid: options.pid,
   });
 }
@@ -552,13 +682,16 @@ export class GitHubUpdater {
 
       await fs.access(downloadPath);
 
-      const { targetPath, relaunchPath } = await resolveInstallTarget(app.getPath('exe'));
+      const { targetPath, relaunchPath, executableRelativePath } = await resolveInstallTarget(
+        app.getPath('exe')
+      );
       log.info(`GitHubUpdater: Install target: ${targetPath}`);
 
       const swap = await prepareUpdateInstall({
         archivePath: downloadPath,
         targetPath,
         relaunchPath,
+        executableRelativePath,
         pid: process.pid,
       });
 

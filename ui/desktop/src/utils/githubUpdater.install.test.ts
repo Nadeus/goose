@@ -35,6 +35,13 @@ async function writeLauncher(dir: string, markerPath: string): Promise<string> {
   return launcher;
 }
 
+function executableRelativePath(): string {
+  if (process.platform === 'darwin') {
+    return path.join('Contents', 'MacOS', 'Goose');
+  }
+  return process.platform === 'win32' ? 'Goose.cmd' : 'Goose';
+}
+
 async function makePayload(root: string, version: string, markerPath: string): Promise<string> {
   if (process.platform === 'darwin') {
     const bundle = path.join(root, 'Goose.app');
@@ -60,6 +67,14 @@ async function makePayload(root: string, version: string, markerPath: string): P
   await fs.mkdir(payload, { recursive: true });
   await writeLauncher(payload, markerPath);
   await fs.writeFile(path.join(payload, 'version.txt'), version);
+  return payload;
+}
+
+// A structurally valid payload directory that was packaged without the application executable.
+async function makeEmptyPayload(root: string): Promise<string> {
+  const payload = path.join(root, process.platform === 'darwin' ? 'Goose.app' : 'Goose');
+  await fs.mkdir(payload, { recursive: true });
+  await fs.writeFile(path.join(payload, 'README.txt'), 'no executable here');
   return payload;
 }
 
@@ -130,7 +145,7 @@ describe('prepareUpdateInstall', () => {
     const relaunchPath =
       process.platform === 'darwin'
         ? installedRoot
-        : path.join(installedRoot, process.platform === 'win32' ? 'Goose.cmd' : 'Goose');
+        : path.join(installedRoot, executableRelativePath());
 
     const runningApp = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], {
       stdio: 'ignore',
@@ -142,6 +157,7 @@ describe('prepareUpdateInstall', () => {
       archivePath,
       targetPath: installedRoot,
       relaunchPath,
+      executableRelativePath: executableRelativePath(),
       pid: runningApp.pid!,
     });
 
@@ -194,7 +210,7 @@ describe('prepareUpdateInstall', () => {
     const relaunchPath =
       process.platform === 'darwin'
         ? installedRoot
-        : path.join(installedRoot, process.platform === 'win32' ? 'Goose.cmd' : 'Goose');
+        : path.join(installedRoot, executableRelativePath());
 
     const exitedApp = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', windowsHide: true });
     await new Promise((resolve) => exitedApp.once('exit', resolve));
@@ -203,6 +219,7 @@ describe('prepareUpdateInstall', () => {
       archivePath,
       targetPath: installedRoot,
       relaunchPath,
+      executableRelativePath: executableRelativePath(),
       pid: exitedApp.pid!,
     });
 
@@ -216,11 +233,33 @@ describe('prepareUpdateInstall', () => {
     });
     swapProcess.unref();
 
-    expect(
-      await waitFor(
-        async () => (await fs.readFile(versionFile, 'utf8').catch(() => '')) === '1.0.0',
-        30000
-      )
-    ).toBe(true);
+    // The restored app is relaunched at the end of the swap, so the marker proves the script
+    // ran to completion rather than merely that the rollback has not happened yet.
+    expect(await waitFor(() => exists(markerPath), 30000)).toBe(true);
+    expect(await exists(`${installedRoot}.goose-previous`)).toBe(false);
+    expect(await fs.readFile(versionFile, 'utf8')).toBe('1.0.0');
+    expect(await exists(path.join(installedRoot, executableRelativePath()))).toBe(true);
+  }, 60000);
+
+  it('refuses to install a payload that is missing its executable', async () => {
+    const workspace = await makeTempDir('goose-update-invalid-');
+    const stagingDir = path.join(workspace, 'staging');
+    const payloadSource = path.join(workspace, 'payload');
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.mkdir(payloadSource, { recursive: true });
+
+    const emptyPayload = await makeEmptyPayload(payloadSource);
+    const archivePath = path.join(stagingDir, 'Goose-2.0.0.zip');
+    await zip(emptyPayload, archivePath);
+
+    await expect(
+      prepareUpdateInstall({
+        archivePath,
+        targetPath: path.join(workspace, 'install', 'Goose'),
+        relaunchPath: path.join(workspace, 'install', 'Goose'),
+        executableRelativePath: executableRelativePath(),
+        pid: process.pid,
+      })
+    ).rejects.toThrow(/missing its executable/);
   }, 60000);
 });

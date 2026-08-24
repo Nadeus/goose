@@ -20,7 +20,9 @@ async function makeTempDir(): Promise<string> {
 async function makeInstallDir(root: string, name: string): Promise<string> {
   const installDir = path.join(root, name);
   await fs.mkdir(path.join(installDir, 'resources'), { recursive: true });
+  await fs.mkdir(path.join(installDir, 'locales'), { recursive: true });
   await fs.writeFile(path.join(installDir, 'resources', 'app.asar'), 'asar');
+  await fs.writeFile(path.join(installDir, 'locales', 'en-US.pak'), 'pak');
   const exePath = path.join(installDir, originalPlatform === 'win32' ? 'Goose.exe' : 'goose');
   await fs.writeFile(exePath, 'binary');
   return exePath;
@@ -39,6 +41,7 @@ describe('resolveInstallTarget', () => {
     await expect(resolveInstallTarget(exePath)).resolves.toEqual({
       targetPath: '/Applications/Goose.app',
       relaunchPath: '/Applications/Goose.app',
+      executableRelativePath: path.join('Contents', 'MacOS', 'Goose'),
     });
   });
 
@@ -58,6 +61,7 @@ describe('resolveInstallTarget', () => {
     await expect(resolveInstallTarget(exePath)).resolves.toEqual({
       targetPath: path.dirname(exePath),
       relaunchPath: exePath,
+      executableRelativePath: path.basename(exePath),
     });
   });
 
@@ -79,6 +83,29 @@ describe('resolveInstallTarget', () => {
     const exePath = await makeInstallDir(root, 'Downloads');
 
     await expect(resolveInstallTarget(exePath)).rejects.toThrow(/is a shared directory/);
+  });
+
+  it('refuses to update a plausibly named directory shared with unrelated files', async () => {
+    setPlatform('linux');
+    const root = await makeTempDir();
+    const exePath = await makeInstallDir(root, 'Stuff');
+    await fs.writeFile(path.join(path.dirname(exePath), 'tax-return.pdf'), 'important');
+
+    await expect(resolveInstallTarget(exePath)).rejects.toThrow(/is not dedicated to the app/);
+  });
+
+  it('refuses to update when the install directory is missing Electron runtime directories', async () => {
+    setPlatform('linux');
+    const root = await makeTempDir();
+    const installDir = path.join(root, 'goose-linux-x64');
+    await fs.mkdir(path.join(installDir, 'resources'), { recursive: true });
+    await fs.writeFile(path.join(installDir, 'resources', 'app.asar'), 'asar');
+    const exePath = path.join(installDir, 'goose');
+    await fs.writeFile(exePath, 'binary');
+
+    await expect(resolveInstallTarget(exePath)).rejects.toThrow(
+      /does not look like an app install directory/
+    );
   });
 
   it('refuses to update when the install directory is the home directory', async () => {
