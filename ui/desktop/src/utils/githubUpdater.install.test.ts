@@ -184,6 +184,64 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
 
+// Running the generated script in the foreground is the only way to see its exit code and
+// error output. The production path detaches it, which hides both.
+function runToCompletion(
+  command: string,
+  args: string[]
+): Promise<{ code: number | null; output: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true });
+    let output = '';
+    child.stdout.on('data', (chunk) => (output += chunk));
+    child.stderr.on('data', (chunk) => (output += chunk));
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code, output }));
+  });
+}
+
+describe('swap script execution', () => {
+  it('runs to completion and reports no error', async () => {
+    const workspace = await makeTempDir('goose-update-probe-');
+    const stagingDir = path.join(workspace, 'staging');
+    const payloadSource = path.join(workspace, 'payload');
+    const installRoot = path.join(workspace, 'install');
+    const markerPath = path.join(workspace, 'relaunched.txt');
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.mkdir(payloadSource, { recursive: true });
+    await fs.mkdir(installRoot, { recursive: true });
+
+    const newPayload = await makePayload(payloadSource, '2.0.0', markerPath);
+    const archivePath = path.join(stagingDir, 'Goose-2.0.0.zip');
+    await zip(newPayload, archivePath);
+
+    const installedRoot = await makePayload(installRoot, '1.0.0', markerPath);
+    const relaunchPath =
+      process.platform === 'darwin'
+        ? installedRoot
+        : path.join(installedRoot, executableRelativePath());
+
+    const exited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', windowsHide: true });
+    await new Promise((resolve) => exited.once('exit', resolve));
+
+    const swap = await prepareUpdateInstall({
+      archivePath,
+      targetPath: installedRoot,
+      relaunchPath,
+      executableRelativePath: executableRelativePath(),
+      pid: exited.pid!,
+    });
+
+    const { code, output } = await runToCompletion(swap.command, swap.args);
+    const detail = `exit=${code}\noutput:\n${output}\ninstall dir:\n${await listTree(installRoot)}`;
+
+    expect(code, detail).toBe(0);
+    expect(await fs.readFile(path.join(installedRoot, 'version.txt'), 'utf8'), detail).toBe(
+      '2.0.0'
+    );
+  }, 120000);
+});
+
 describe('prepareUpdateInstall', () => {
   it('waits for the app to exit, swaps in the new version, and relaunches it', async () => {
     const workspace = await makeTempDir('goose-update-test-');
